@@ -1,100 +1,69 @@
-import express from 'express';
-import { createServer } from 'http';
-import { Server } from 'socket.io';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import authRoutes from './routes/auth.js';
-import messageRoutes from './routes/messages.js';
-import userRoutes from './routes/users.js';
-import { authenticateSocket } from './middleware/auth.js';
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const path = require('path');
+const http = require('http');
+const { Server } = require('socket.io');
 
-dotenv.config();
+const authRoutes = require('./routes/auth');
+const userRoutes = require('./routes/users');
+const messageRoutes = require('./routes/messages');
 
 const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.CLIENT_URL || "http://localhost:5173",
-    methods: ["GET", "POST"]
-  }
+const server = http.createServer(app);
+
+const io = new Server(server, {
+  cors: { origin: '*' }
 });
+
+// make io available in routes
+app.set('io', io);
 
 app.use(cors());
 app.use(express.json());
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// Routes
+// routes
 app.use('/api/auth', authRoutes);
-app.use('/api/messages', messageRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/messages', messageRoutes);
 
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
-});
-
-// Socket.io connection
-const onlineUsers = new Map();
-
-io.use(authenticateSocket);
-
+// socket
 io.on('connection', (socket) => {
-  const userId = socket.userId;
-  console.log(`User connected: ${userId}`);
-  
-  // Add user to online users
-  onlineUsers.set(userId, socket.id);
-  io.emit('user_online', { userId, online: true });
+  console.log('socket connected', socket.id);
 
-  // Join user's personal room
-  socket.join(`user:${userId}`);
-
-  // Handle sending messages
-  socket.on('send_message', async (data) => {
-    const { receiverId, text } = data;
-    
-    // Broadcast to receiver if online
-    const receiverSocketId = onlineUsers.get(receiverId);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('new_message', {
-        senderId: userId,
-        text,
-        timestamp: new Date().toISOString()
-      });
-    }
-    
-    // Also send back to sender for confirmation
-    socket.emit('message_sent', {
-      receiverId,
-      text,
-      timestamp: new Date().toISOString()
-    });
+  socket.on('join', (userId) => {
+    socket.join(userId);
   });
 
-  // Handle typing indicator
-  socket.on('typing', (data) => {
-    const { receiverId } = data;
-    const receiverSocketId = onlineUsers.get(receiverId);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('user_typing', { userId });
-    }
+  socket.on('send_message', (msg) => {
+    io.to(msg.receiver).emit('receive_message', msg);
   });
 
-  socket.on('stop_typing', (data) => {
-    const { receiverId } = data;
-    const receiverSocketId = onlineUsers.get(receiverId);
-    if (receiverSocketId) {
-      io.to(receiverSocketId).emit('user_stop_typing', { userId });
-    }
+  socket.on('typing', ({from, to}) => {
+    io.to(to).emit('typing', { from });
   });
 
-  // Handle disconnect
-  socket.on('disconnect', () => {
-    console.log(`User disconnected: ${userId}`);
-    onlineUsers.delete(userId);
-    io.emit('user_online', { userId, online: false });
+  socket.on('stop_typing', ({from, to}) => {
+    io.to(to).emit('stop_typing', { from });
   });
+
+  socket.on('message_edited', (msg) => {
+    io.to(msg.receiver).emit('message_edited', msg);
+  });
+
+  socket.on('message_deleted', (info) => {
+    io.to(info.receiver).emit('message_deleted', info);
+  });
+
+  socket.on('disconnect', () => {});
 });
 
-const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+const PORT = process.env.PORT || 5000;
+
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => {
+    server.listen(PORT, () => console.log('Backend listening on', PORT));
+  })
+  .catch(err => console.error(err));
