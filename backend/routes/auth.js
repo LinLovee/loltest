@@ -1,98 +1,55 @@
-import express from 'express';
-import bcrypt from 'bcrypt';
-import pool from '../db.js';
-import { generateToken } from '../middleware/auth.js';
-
+const express = require('express');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 const router = express.Router();
+const User = require('../models/User');
 
-// Register
 router.post('/register', async (req, res) => {
-  const { username, email, password } = req.body;
-
-  if (!username || !email || !password) {
-    return res.status(400).json({ error: 'All fields are required' });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ error: 'Password must be at least 6 characters' });
-  }
-
   try {
-    // Check if user exists
-    const userExists = await pool.query(
-      'SELECT * FROM users WHERE username = $1 OR email = $2',
-      [username, email]
-    );
+    const { name, username, password } = req.body;
+    if (!name || !username || !password) return res.status(400).json({ message: 'Заполните поля' });
 
-    if (userExists.rows.length > 0) {
-      return res.status(400).json({ error: 'Username or email already exists' });
-    }
+    const exists = await User.findOne({ username });
+    if (exists) return res.status(400).json({ message: 'Username занят' });
 
-    // Hash password
-    const passwordHash = await bcrypt.hash(password, 10);
+    const hashed = await bcrypt.hash(password, 10);
 
-    // Create user
-    const result = await pool.query(
-      'INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, created_at',
-      [username, email, passwordHash]
-    );
+    const user = await User.create({ name, username, password: hashed });
 
-    const user = result.rows[0];
-    const token = generateToken(user.id);
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
 
-    res.status(201).json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email
-      },
-      token
-    });
-  } catch (error) {
-    console.error('Register error:', error);
-    res.status(500).json({ error: 'Server error' });
+    res.json({ token, user: { _id: user._id, name: user.name, username: user.username, avatar: user.avatar } });
+
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка регистрации' });
   }
 });
 
-// Login
 router.post('/login', async (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ error: 'Username and password are required' });
-  }
-
   try {
-    const result = await pool.query(
-      'SELECT * FROM users WHERE username = $1',
-      [username]
-    );
+    const { username, password } = req.body;
+    const user = await User.findOne({ username });
+    if (!user) return res.status(400).json({ message: 'Неверные данные' });
 
-    if (result.rows.length === 0) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    const ok = await bcrypt.compare(password, user.password);
+    if (!ok) return res.status(400).json({ message: 'Неверные данные' });
 
-    const user = result.rows[0];
-    const validPassword = await bcrypt.compare(password, user.password_hash);
-
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = generateToken(user.id);
-
-    res.json({
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email
-      },
-      token
-    });
-  } catch (error) {
-    console.error('Login error:', error);
-    res.status(500).json({ error: 'Server error' });
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET);
+    res.json({ token, user: { _id: user._id, name: user.name, username: user.username, avatar: user.avatar } });
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка входа' });
   }
 });
 
-export default router;
+router.delete('/delete', require('../middleware/auth'), async (req, res) => {
+  try {
+    const Message = require('../models/Message');
+    await Message.deleteMany({ $or: [{ sender: req.user._id }, { receiver: req.user._id }] });
+    await User.findByIdAndDelete(req.user._id);
+    res.json({ message: 'Аккаунт удалён' });
+  } catch (err) {
+    res.status(500).json({ message: 'Ошибка удаления' });
+  }
+});
+
+module.exports = router;

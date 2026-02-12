@@ -1,115 +1,104 @@
-import express from 'express';
-import pool from '../db.js';
-import { authenticateToken } from '../middleware/auth.js';
-
+const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const path = require('path');
+const auth = require('../middleware/auth');
+const Message = require('../models/Message');
 
-// Get conversation with a user
-router.get('/conversation/:userId', authenticateToken, async (req, res) => {
-  const currentUserId = req.userId;
-  const otherUserId = parseInt(req.params.userId);
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, path.join(__dirname, '..', 'uploads')),
+  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
+});
+const upload = multer({ storage });
 
+// отправить текстовое сообщение и сохранить в БД
+router.post('/send', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT m.*, 
-        sender.username as sender_username,
-        receiver.username as receiver_username
-       FROM messages m
-       JOIN users sender ON m.sender_id = sender.id
-       JOIN users receiver ON m.receiver_id = receiver.id
-       WHERE (m.sender_id = $1 AND m.receiver_id = $2)
-          OR (m.sender_id = $2 AND m.receiver_id = $1)
-       ORDER BY m.created_at ASC
-       LIMIT 100`,
-      [currentUserId, otherUserId]
-    );
+    const { receiver, text, type } = req.body;
+    const message = await Message.create({ sender: req.user._id, receiver, text, type: type || 'text' });
 
-    // Mark messages as read
-    await pool.query(
-      `UPDATE messages 
-       SET read = TRUE 
-       WHERE receiver_id = $1 AND sender_id = $2 AND read = FALSE`,
-      [currentUserId, otherUserId]
-    );
+    // emit via socket
+    const io = req.app.get('io');
+    io.to(receiver).emit('receive_message', message);
 
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Get conversation error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
+    res.json(message);
+  } catch (err) { res.status(500).json({ message: 'Ошибка отправки' }); }
 });
 
-// Send a message
-router.post('/send', authenticateToken, async (req, res) => {
-  const senderId = req.userId;
-  const { receiverId, text } = req.body;
-
-  if (!receiverId || !text || !text.trim()) {
-    return res.status(400).json({ error: 'Receiver and message text are required' });
-  }
-
+// отправить файл (image/video/file/voice)
+router.post('/upload', auth, upload.single('file'), async (req, res) => {
   try {
-    const result = await pool.query(
-      `INSERT INTO messages (sender_id, receiver_id, text) 
-       VALUES ($1, $2, $3) 
-       RETURNING id, sender_id, receiver_id, text, created_at, read`,
-      [senderId, receiverId, text.trim()]
-    );
+    const { receiver } = req.body;
+    const file = req.file;
+    if (!file) return res.status(400).json({ message: 'Нет файла' });
 
-    res.status(201).json(result.rows[0]);
-  } catch (error) {
-    console.error('Send message error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
+    const mimetype = file.mimetype;
+    const type = mimetype.startsWith('image') ? 'image' : mimetype.startsWith('video') ? 'video' : mimetype.startsWith('audio') ? 'voice' : 'file';
+
+    const message = await Message.create({
+      sender: req.user._id,
+      receiver,
+      file: file.filename,
+      type
+    });
+
+    // emit via socket
+    const io = req.app.get('io');
+    io.to(receiver).emit('receive_message', message);
+
+    res.json(message);
+  } catch (err) { res.status(500).json({ message: 'Ошибка загрузки' }); }
 });
 
-// Get recent conversations
-router.get('/conversations', authenticateToken, async (req, res) => {
-  const userId = req.userId;
-
+// получить историю с пользователем
+router.get('/history/:userId', auth, async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT DISTINCT ON (other_user_id)
-        other_user_id,
-        other_username,
-        last_message,
-        last_message_time,
-        unread_count
-       FROM (
-         SELECT 
-           CASE 
-             WHEN m.sender_id = $1 THEN m.receiver_id 
-             ELSE m.sender_id 
-           END as other_user_id,
-           CASE 
-             WHEN m.sender_id = $1 THEN receiver.username 
-             ELSE sender.username 
-           END as other_username,
-           m.text as last_message,
-           m.created_at as last_message_time,
-           (SELECT COUNT(*) 
-            FROM messages 
-            WHERE sender_id = CASE 
-              WHEN m.sender_id = $1 THEN m.receiver_id 
-              ELSE m.sender_id 
-            END
-            AND receiver_id = $1 
-            AND read = FALSE) as unread_count
-         FROM messages m
-         JOIN users sender ON m.sender_id = sender.id
-         JOIN users receiver ON m.receiver_id = receiver.id
-         WHERE m.sender_id = $1 OR m.receiver_id = $1
-         ORDER BY m.created_at DESC
-       ) sub
-       ORDER BY other_user_id, last_message_time DESC`,
-      [userId]
-    );
+    const otherId = req.params.userId;
+    const msgs = await Message.find({ $or: [
+      { sender: req.user._id, receiver: otherId },
+      { sender: otherId, receiver: req.user._id }
+    ] }).sort({ createdAt: 1 });
 
-    res.json(result.rows);
-  } catch (error) {
-    console.error('Get conversations error:', error);
-    res.status(500).json({ error: 'Server error' });
-  }
+    res.json(msgs);
+  } catch (err) { res.status(500).json({ message: 'Ошибка' }); }
 });
 
-export default router;
+// редактировать сообщение
+router.put('/:id', auth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const { text } = req.body;
+    const msg = await Message.findById(id);
+    if (!msg) return res.status(404).json({ message: 'Не найдено' });
+    if (String(msg.sender) !== String(req.user._id)) return res.status(403).json({ message: 'Нет прав' });
+
+    msg.text = text;
+    msg.edited = true;
+    msg.editedAt = new Date();
+    await msg.save();
+
+    const io = req.app.get('io');
+    io.to(msg.receiver).emit('message_edited', msg);
+
+    res.json(msg);
+  } catch (err) { res.status(500).json({ message: 'Ошибка' }); }
+});
+
+// удалить сообщение
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const msg = await Message.findById(id);
+    if (!msg) return res.status(404).json({ message: 'Не найдено' });
+    if (String(msg.sender) !== String(req.user._id)) return res.status(403).json({ message: 'Нет прав' });
+
+    await Message.findByIdAndDelete(id);
+
+    const io = req.app.get('io');
+    io.to(msg.receiver).emit('message_deleted', { id, receiver: msg.receiver, sender: msg.sender });
+
+    res.json({ message: 'Удалено' });
+  } catch (err) { res.status(500).json({ message: 'Ошибка' }); }
+});
+
+module.exports = router;
