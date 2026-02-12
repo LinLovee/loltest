@@ -1,57 +1,22 @@
-import { useState, useEffect } from 'react'
-import Auth from './components/Auth'
-import Chat from './components/Chat'
-import { checkAuth } from './utils/api'
+import React, { useState, useEffect } from 'react';
+import Login from './pages/Login';
+import Register from './pages/Register';
+import Chat from './pages/Chat';
 
-function App() {
-  const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(true)
+export default function App() {
+  const [user, setUser] = useState(() => {
+    const raw = localStorage.getItem('user');
+    return raw ? JSON.parse(raw) : null;
+  });
+  const [page, setPage] = useState(user ? 'chat' : 'login');
 
   useEffect(() => {
-    const token = localStorage.getItem('token')
-    if (token) {
-      checkAuth(token)
-        .then(userData => {
-          setUser(userData)
-        })
-        .catch(() => {
-          localStorage.removeItem('token')
-        })
-        .finally(() => {
-          setLoading(false)
-        })
-    } else {
-      setLoading(false)
-    }
-  }, [])
+    if (user) { localStorage.setItem('user', JSON.stringify(user)); setPage('chat'); }
+    else localStorage.removeItem('user');
+  }, [user]);
 
-  const handleLogin = (userData, token) => {
-    localStorage.setItem('token', token)
-    setUser(userData)
-  }
+  if (page === 'login') return <Login onRegister={() => setPage('register')} onLogin={(u) => setUser(u)} />;
+  if (page === 'register') return <Register onBack={() => setPage('login')} onRegister={(u) => setUser(u)} />;
 
-  const handleLogout = () => {
-    localStorage.removeItem('token')
-    setUser(null)
-  }
-
-  if (loading) {
-    return (
-      <div className="app" style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <div style={{ fontSize: '24px', color: '#888' }}>Загрузка...</div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="app">
-      {user ? (
-        <Chat user={user} onLogout={handleLogout} />
-      ) : (
-        <Auth onLogin={handleLogin} />
-      )}
-    </div>
-  )
+  return <Chat user={user} onLogout={() => { localStorage.removeItem('token'); setUser(null); setPage('login'); }} />;
 }
-
-export default App
